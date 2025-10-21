@@ -41,11 +41,13 @@ def _normalize_ip(ip: str) -> str:
 
 def _expected_code(mac: str, ip: str, length: int = 12) -> str:
     secret = getattr(settings, "DEVICE_SECRET", None) or "123456789"
-    if not getattr(settings, "DEVICE_SECRET", None):
-        logger.warning("DEVICE_SECRET не задан — используется небезопасный fallback!")
-    data = f"{_normalize_mac(mac)}-{_normalize_ip(ip)}".encode("utf-8")
-    digest = hmac.new(secret.encode("utf-8"), data, hashlib.sha256).hexdigest()
-    return digest[:length]
+    data = f"{secret}-{_normalize_mac(mac)}-{_normalize_ip(ip)}".encode("utf-8")
+    h = 0xcbf29ce484222325
+    for b in data:
+        h ^= b
+        h = (h * 0x100000001b3) & 0xFFFFFFFFFFFFFFFF
+    return f"{h:016x}"[:length]
+
 
 async def check_code(
     table: str, 
