@@ -163,6 +163,12 @@ async def ws_device(websocket: WebSocket, table: str, device: str, id: int = 0):
 
     except WebSocketDisconnect:
         await manager.disconnect(table, device, id)
+        if device.lower().startswith("button"):
+            task = party_tasks.pop(table, None)
+            if task:
+                task.cancel()
+                await manager.set_table_colors(table, "green", True)
+                print(f"[i] Party mode task cancelled (button disconnect) for {table}")
     except Exception as e:
         print(f"[!] Error in {key}: {e}\n{traceback.format_exc()}")
         await manager.disconnect(table, device, id)
