@@ -1,10 +1,11 @@
 #include <SPI.h>
 #include <Ethernet.h>
 #include <EthernetUDP.h>
+#include <Dynamixel2Arduino.h>
 
-// --- НАСТРОЙКИ ---
-const char* DEVICE_ID = "ID:T4:DL:N2";
-const int TABLE_NUM = 1;
+// ---------- Настройки лампы (без изменений) ----------
+const char* DEVICE_ID = "ID:T3:DL:N1";
+const int TABLE_NUM = 3;
 const int DEVICE_NUM = 1;
 
 const int PIN_Y = 2;
@@ -21,26 +22,46 @@ EthernetUDP Udp;
 
 unsigned long lastStatusSend = 0;
 const unsigned long STATUS_INTERVAL = 10000; // 10 сек
-
 unsigned long lastRegSend = 0;
 const unsigned long REG_INTERVAL = 30000;    // 30 сек
 
+// ---------- Настройки Dynamixel ----------
+#define DXL_SERIAL   Serial3          // используем Serial3 на Mega
+#define DXL_DIR_PIN  -1                // пин направления (если RS485, укажите номер пина)
+const uint8_t MOTOR_IDS[] = {1, 4, 2, 3, 5, 6}; // ID моторов согласно фото (001,004,002,003,005,006)
+const int NUM_MOTORS = sizeof(MOTOR_IDS) / sizeof(MOTOR_IDS[0]);
+const uint32_t DXL_BAUDRATE = 57600;   // стандартная скорость Dynamixel, может отличаться
+
+Dynamixel2Arduino dxl(DXL_SERIAL, DXL_DIR_PIN);
+
+// ---------- Прототипы функций моторов ----------
+void initMotors();
+void setMotorPosition(uint8_t id, uint16_t position);
+bool isValidMotorID(uint8_t id);
+
+// ---------- Setup ----------
 void setup() {
   pinMode(PIN_R, OUTPUT); pinMode(PIN_Y, OUTPUT);
   pinMode(PIN_G, OUTPUT); pinMode(PIN_B, OUTPUT);
   Serial.begin(9600);
 
+  // Инициализация Ethernet
   Ethernet.begin(mac);
   delay(1000);
-
   Udp.begin(LOCAL_PORT);
   Serial.print("UDP started on port ");
   Serial.println(LOCAL_PORT);
+
+  // Инициализация Dynamixel
+  dxl.begin(DXL_BAUDRATE);
+  dxl.setPortProtocolVersion(2.0);      // Протокол 2.0
+  initMotors();                          // Пинг и включение моторов
 
   sendRegistration();
   lastRegSend = millis();
 }
 
+// ---------- Функции лампы (без изменений) ----------
 void sendRegistration() {
   Udp.beginPacket(server, SERVER_PORT);
   Udp.write(DEVICE_ID);
@@ -78,6 +99,49 @@ void setColor(char color, int state) {
   }
 }
 
+// ---------- Функции моторов ----------
+void initMotors() {
+  for (int i = 0; i < NUM_MOTORS; i++) {
+    uint8_t id = MOTOR_IDS[i];
+    if (dxl.ping(id)) {
+      Serial.print("Motor ID ");
+      Serial.print(id);
+      Serial.println(" found. Enabling torque...");
+      dxl.torqueOn(id);
+      dxl.setOperatingMode(id, OP_POSITION); // Режим управления позицией
+      // Можно задать другие параметры: скорость, ускорение и т.д.
+    } else {
+      Serial.print("Motor ID ");
+      Serial.print(id);
+      Serial.println(" NOT responding.");
+    }
+  }
+}
+
+bool isValidMotorID(uint8_t id) {
+  for (int i = 0; i < NUM_MOTORS; i++) {
+    if (MOTOR_IDS[i] == id) return true;
+  }
+  return false;
+}
+
+void setMotorPosition(uint8_t id, uint16_t position) {
+  if (!isValidMotorID(id)) {
+    Serial.print("Invalid motor ID: ");
+    Serial.println(id);
+    return;
+  }
+  // Ограничение позиции (0-4095 для 12-битных моделей)
+  position = constrain(position, 0, 4095);
+  dxl.setGoalPosition(id, position, UNIT_RAW);
+  Serial.print("Set motor ");
+  Serial.print(id);
+  Serial.print(" to position ");
+  Serial.println(position);
+  // При желании можно отправить подтверждение на сервер, но в данном примере не требуется
+}
+
+// ---------- Основной цикл ----------
 void loop() {
   int packetSize = Udp.parsePacket();
   if (packetSize) {
@@ -90,18 +154,15 @@ void loop() {
       Serial.print("Received: ");
       Serial.println(cmd);
 
+      // ----- Команды лампы (без изменений) -----
       if (cmd == "1111") {
-        digitalWrite(PIN_R, HIGH);
-        digitalWrite(PIN_Y, HIGH);
-        digitalWrite(PIN_G, HIGH);
-        digitalWrite(PIN_B, HIGH);
+        digitalWrite(PIN_R, HIGH); digitalWrite(PIN_Y, HIGH);
+        digitalWrite(PIN_G, HIGH); digitalWrite(PIN_B, HIGH);
         sendFullStatus();
       }
       else if (cmd == "0000") {
-        digitalWrite(PIN_R, LOW);
-        digitalWrite(PIN_Y, LOW);
-        digitalWrite(PIN_G, LOW);
-        digitalWrite(PIN_B, LOW);
+        digitalWrite(PIN_R, LOW); digitalWrite(PIN_Y, LOW);
+        digitalWrite(PIN_G, LOW); digitalWrite(PIN_B, LOW);
         sendFullStatus();
       }
       else if (cmd.length() == 2) {
@@ -109,14 +170,28 @@ void loop() {
         int state = cmd.substring(1).toInt();
         setColor(color, state);
       }
+      // ----- Команды моторов (новые) -----
+      else if (cmd.startsWith("M")) {
+        // Формат: M<ID>:<POSITION>  (например "M001:2048")
+        int colonIdx = cmd.indexOf(':');
+        if (colonIdx > 1) {
+          String idStr = cmd.substring(1, colonIdx);
+          String posStr = cmd.substring(colonIdx + 1);
+          uint8_t id = (uint8_t)idStr.toInt();
+          uint16_t pos = (uint16_t)posStr.toInt();
+          setMotorPosition(id, pos);
+        } else {
+          Serial.println("Invalid motor command format");
+        }
+      }
     }
   }
 
+  // Периодическая отправка статуса лампы (без изменений)
   if (millis() - lastStatusSend >= STATUS_INTERVAL) {
     sendFullStatus();
     lastStatusSend = millis();
   }
-
   if (millis() - lastRegSend >= REG_INTERVAL) {
     sendRegistration();
     lastRegSend = millis();
