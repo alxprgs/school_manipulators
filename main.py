@@ -3,52 +3,33 @@ import random
 from fastapi import FastAPI, HTTPException
 from contextlib import asynccontextmanager
 from pydantic import BaseModel
-from typing import Dict, Optional, Tuple
+from typing import Dict, Optional
 import time
 
+# ====================== ГЛОБАЛЬНЫЕ ПЕРЕМЕННЫЕ ======================
+devices: Dict[str, tuple] = {}           # full_id -> (ip, port)
+lamps: Dict[str, tuple] = {}             # только лампы
+manipulators: Dict[str, tuple] = {}      # только манипуляторы
+remotes: Dict[str, tuple] = {}           # только пульты
 
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    loop = asyncio.get_running_loop()
-    transport, protocol = await loop.create_datagram_endpoint(
-        lambda: UDPProtocol(),
-        local_addr=('0.0.0.0', 8888)
-    )
-    app.state.udp_transport = transport
-    app.state.udp_protocol = protocol
+remote_states: Dict[str, dict] = {}      # состояние пульта
+remote_to_mp: Dict[str, str] = {}        # какой манипулятор сейчас выбран пультом
+remote_to_layer: Dict[str, int] = {}     # текущий слой 0-2
+manip_pos: Dict[str, Dict[int, int]] = {} # текущее положение серв (для velocity)
 
-    cleanup_task = loop.create_task(cleanup_dead_connections())
-    print("[!] UDP сервер запущен на порту 8888")
-    yield
-    cleanup_task.cancel()
-    transport.close()
+list_manips: list = []                   # список всех манипуляторов для переключения
 
-
-app = FastAPI(lifespan=lifespan, docs_url="/docs", openapi_url="/openapi")
-
-# Общий словарь всех устройств (для отправки команд и last_seen)
-devices: Dict[str, Tuple[str, int]] = {}          # полный ID -> (ip, port)
-
-# Словари по типам
-lamps: Dict[str, Tuple[str, int]] = {}            # только лампы
-remotes: Dict[str, Tuple[str, int]] = {}          # только пульты
-
-# Состояния
-lamp_states: Dict[str, str] = {}                  # полный статус лампы (строка)
-remote_states: Dict[str, dict] = {}                # распарсенные данные пульта
-
-# Короткие идентификаторы
-short_to_full: Dict[str, str] = {}                 # короткий ID -> полный ID
-last_seen: Dict[str, float] = {}                    # для всех устройств
+lamp_states: Dict[str, str] = {}
+short_to_full: Dict[str, str] = {}
+last_seen: Dict[str, float] = {}
 
 disco_active = False
 disco_task: Optional[asyncio.Task] = None
-original_states: Dict[str, Dict[str, int]] = {}     # сохранённые состояния ламп перед дискотекой
+original_states: Dict[str, Dict[str, int]] = {}
 
 
-# ---------- Вспомогательные функции ----------
+# ====================== ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ======================
 def parse_lamp_state(state_str: str) -> Dict[str, int]:
-    """Из строки 'T1:DL:N1:AC:R0:Y0:G0:B0' достаёт {'R':0, 'Y':0, 'G':0, 'B':0}"""
     parts = state_str.split(':')
     state = {}
     for part in parts:
@@ -60,7 +41,6 @@ def parse_lamp_state(state_str: str) -> Dict[str, int]:
 
 
 def parse_remote_state(state_str: str) -> dict:
-    """Парсит строку состояния пульта в словарь."""
     parts = state_str.split(':')
     state = {}
     for part in parts:
@@ -82,7 +62,6 @@ def parse_remote_state(state_str: str) -> dict:
 
 
 async def send_command(device_id: str, command: str) -> bool:
-    """Отправляет UDP-команду устройству."""
     if device_id not in devices:
         return False
     addr = devices[device_id]
@@ -96,35 +75,25 @@ async def send_command(device_id: str, command: str) -> bool:
 
 
 async def remove_device(device_id: str):
-    """Удаляет устройство из всех словарей."""
-    # Удаляем из short_to_full
     short = device_id.replace("ID:", "")
     short_to_full.pop(short, None)
-
-    # Удаляем из общих словарей
     devices.pop(device_id, None)
     last_seen.pop(device_id, None)
-
-    # Удаляем из словарей по типам
     lamps.pop(device_id, None)
     remotes.pop(device_id, None)
+    manipulators.pop(device_id, None)
     lamp_states.pop(device_id, None)
     remote_states.pop(device_id, None)
-    original_states.pop(device_id, None)  # для дискотеки
-
+    remote_to_mp.pop(device_id, None)
+    remote_to_layer.pop(device_id, None)
+    manip_pos.pop(device_id, None)
+    if device_id in list_manips:
+        list_manips.remove(device_id)
+    original_states.pop(device_id, None)
     print(f"[!] Устройство {device_id} удалено")
 
 
-async def restore_device(device_id: str):
-    """Восстанавливает состояние лампы после дискотеки (используется в disco/stop)."""
-    if device_id not in original_states:
-        return
-    states = original_states[device_id]
-    for color, status in states.items():
-        await send_command(device_id, f"{color}{status}")
-
-
-# ---------- Фоновая проверка ----------
+# ====================== ФОНОВЫЕ ЗАДАЧИ ======================
 async def cleanup_dead_connections():
     while True:
         await asyncio.sleep(30)
@@ -135,7 +104,106 @@ async def cleanup_dead_connections():
             await remove_device(did)
 
 
-# ---------- UDP протокол ----------
+async def manipulator_control_loop():
+    while True:
+        await asyncio.sleep(0.05)  # 50 Гц
+        for rid, state in list(remote_states.items()):
+            if state.get('emergency', 1) == 0:          # авария — ничего не делаем
+                continue
+            mp = remote_to_mp.get(rid)
+            if not mp or mp not in manipulators:
+                continue
+
+            layer = remote_to_layer.get(rid, 0)
+            jx = state.get('joy_x', 512) - 512
+            jy = state.get('joy_y', 512) - 512
+
+            if abs(jx) <= 40 and abs(jy) <= 40:         # deadzone — фиксируем позицию
+                continue
+
+            # Скорость пропорциональна отклонению джойстика
+            delta_x = int(jx / 512.0 * 45)   # подбери под себя
+            delta_y = int(jy / 512.0 * 45)
+
+            if delta_x == 0 and delta_y == 0:
+                continue
+
+            # Какие моторы в текущем слое
+            motors = [[1, 2], [3, 4], [5, 6]]
+            m1, m2 = motors[layer]
+
+            p1 = manip_pos[mp][m1] + delta_x
+            p2 = manip_pos[mp][m2] + delta_y
+            p1 = max(0, min(4095, p1))
+            p2 = max(0, min(4095, p2))
+
+            await send_command(mp, f"M{m1}:{p1}")
+            await send_command(mp, f"M{m2}:{p2}")
+
+            manip_pos[mp][m1] = p1
+            manip_pos[mp][m2] = p2
+
+
+def update_lcd_for_remote(rid: str):
+    mp = remote_to_mp.get(rid, "Нет")
+    layer = remote_to_layer.get(rid, 0)
+    short_mp = mp.split(':')[-1] if mp != "Нет" else "Нет"
+    asyncio.create_task(send_command(rid, f"LCD:2:MP:{short_mp}"))
+    asyncio.create_task(send_command(rid, f"LCD:3:Layer:{layer}"))
+
+
+def handle_switch_mp(addr):
+    """Переключение манипулятора по жёлтой кнопке"""
+    for rid, raddr in list(devices.items()):
+        if raddr == addr and rid in remotes:
+            if not list_manips:
+                return
+            current = remote_to_mp.get(rid)
+            if current not in list_manips or current is None:
+                idx = 0
+            else:
+                idx = list_manips.index(current)
+            new_idx = (idx + 1) % len(list_manips)
+            new_mp = list_manips[new_idx]
+            remote_to_mp[rid] = new_mp
+            if rid not in remote_to_layer:
+                remote_to_layer[rid] = 0
+            update_lcd_for_remote(rid)
+            return
+
+
+def handle_layer_change(addr, delta: int):
+    """Смена слоя красной/зелёной кнопкой"""
+    for rid, raddr in list(devices.items()):
+        if raddr == addr and rid in remotes:
+            layer = remote_to_layer.get(rid, 0)
+            layer = (layer + delta) % 3
+            remote_to_layer[rid] = layer
+            update_lcd_for_remote(rid)
+            return
+
+
+# ====================== LIFESPAN ======================
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    loop = asyncio.get_running_loop()
+    transport, protocol = await loop.create_datagram_endpoint(
+        lambda: UDPProtocol(), local_addr=('0.0.0.0', 8888))
+    app.state.udp_transport = transport
+    app.state.udp_protocol = protocol
+
+    asyncio.create_task(cleanup_dead_connections())
+    asyncio.create_task(manipulator_control_loop())
+
+    print("[!] UDP сервер запущен на порту 8888")
+    yield
+    transport.close()
+
+
+app = FastAPI(lifespan=lifespan, docs_url="/docs", openapi_url="/openapi")
+
+
+# ====================== UDP ПРОТОКОЛ ======================
 class UDPProtocol(asyncio.DatagramProtocol):
     def connection_made(self, transport):
         self.transport = transport
@@ -144,56 +212,66 @@ class UDPProtocol(asyncio.DatagramProtocol):
         msg = data.decode().strip()
         print(f"[<-] От {addr}: {msg}")
 
-        # 1. Регистрация (начинается с "ID:")
+        # 1. Регистрация
         if msg.startswith("ID:"):
             full_id = msg
-            # Определяем тип
+            devices[full_id] = addr
+            last_seen[full_id] = time.time()
+
             if ":DL:" in full_id:
-                device_type = "lamp"
                 lamps[full_id] = addr
+                print(f"[+] Лампа: {full_id}")
+            elif ":MP:" in full_id:
+                manipulators[full_id] = addr
+                list_manips.append(full_id)
+                if full_id not in manip_pos:
+                    manip_pos[full_id] = {i: 2048 for i in range(1, 7)}
+                print(f"[+] Манипулятор: {full_id}")
             elif ":PT:" in full_id:
-                device_type = "remote"
                 remotes[full_id] = addr
+                # Автоматически назначаем первый манипулятор
+                if list_manips and full_id not in remote_to_mp:
+                    remote_to_mp[full_id] = list_manips[0]
+                    remote_to_layer[full_id] = 0
+                    update_lcd_for_remote(full_id)
+                print(f"[+] Пульт: {full_id}")
             else:
-                print(f"[!] Неизвестный тип устройства: {full_id}")
+                print(f"[!] Неизвестный тип: {full_id}")
                 return
 
-            # Добавляем в общий словарь
-            devices[full_id] = addr
             short = full_id.replace("ID:", "")
             short_to_full[short] = full_id
-            last_seen[full_id] = time.time()
-            print(f"[!] Зарегистрирован {device_type}: {full_id}")
 
-        # 2. Статус (начинается с "T")
+        # 2. Статус пульта / лампы
         elif msg.startswith("T"):
             try:
-                # Извлекаем первые три части: T<табл>:<тип>:N<номер>
                 parts = msg.split(':')
                 if len(parts) < 3:
                     return
                 short_key = f"{parts[0]}:{parts[1]}:{parts[2]}"
+                full_id = short_to_full.get(short_key)
+                if not full_id:
+                    return
+
+                last_seen[full_id] = time.time()
+
+                if full_id in lamps:
+                    lamp_states[full_id] = msg
+                elif full_id in remotes:
+                    remote_states[full_id] = parse_remote_state(msg)
+                # для манипулятора статус не обязателен
             except:
-                return
+                pass
 
-            full_id = short_to_full.get(short_key)
-            if not full_id:
-                print(f"[?] Статус от неизвестного устройства: {short_key}")
-                return
+        # 3. Специальные команды от пульта
+        elif msg == "SWITCH_MP":
+            handle_switch_mp(addr)
+        elif msg == "LAYER_PLUS":
+            handle_layer_change(addr, 1)
+        elif msg == "LAYER_MINUS":
+            handle_layer_change(addr, -1)
 
-            last_seen[full_id] = time.time()
-
-            if full_id in lamps:
-                # Для лампы сохраняем строку целиком (нужно для дискотеки)
-                lamp_states[full_id] = msg
-            elif full_id in remotes:
-                # Для пульта парсим детально
-                state = parse_remote_state(msg)
-                remote_states[full_id] = state
-            else:
-                print(f"[?] Устройство {full_id} не найдено ни в lamps, ни в remotes")
-
-        # 3. Любое другое сообщение – пытаемся обновить last_seen по адресу
+        # 4. Остальные сообщения — просто обновляем last_seen
         else:
             for fid, faddr in devices.items():
                 if faddr == addr:
@@ -204,34 +282,36 @@ class UDPProtocol(asyncio.DatagramProtocol):
         print(f"[!] UDP ошибка: {exc}")
 
 
-# ---------- Эндпоинты ----------
+# ====================== ЭНДПОИНТЫ ======================
 class Command(BaseModel):
     device_id: str
     color: str
     status: int
 
 
+class MotorCommand(BaseModel):
+    device_id: str
+    motor_id: int
+    position: int
+
+
 @app.get("/devices")
 async def get_devices():
-    """Общий список всех устройств (для отладки)."""
     return {"online": list(devices.keys())}
 
 
 @app.get("/lamps")
 async def get_lamps():
-    """Список ламп и их состояний."""
     return {"online": list(lamps.keys()), "states": lamp_states}
 
 
 @app.get("/remotes")
 async def get_remotes():
-    """Список пультов и их последних состояний."""
     return {"online": list(remotes.keys()), "states": remote_states}
 
 
 @app.get("/remote/{device_id}")
 async def get_remote_state(device_id: str):
-    """Получить состояние конкретного пульта."""
     if device_id not in remotes:
         raise HTTPException(404, "Remote not found")
     return remote_states.get(device_id, {})
@@ -239,11 +319,10 @@ async def get_remote_state(device_id: str):
 
 @app.post("/control/lamp")
 async def control_lamp(cmd: Command):
-    """Управление лампой (одиночный светодиод)."""
     if cmd.device_id not in lamps:
-        raise HTTPException(404, "Lamp not found or not a lamp")
+        raise HTTPException(404, "Lamp not found")
     if disco_active:
-        raise HTTPException(409, "Disco mode is active, control disabled")
+        raise HTTPException(409, "Disco mode active")
     success = await send_command(cmd.device_id, f"{cmd.color}{cmd.status}")
     if not success:
         raise HTTPException(500, "Send failed")
@@ -252,53 +331,57 @@ async def control_lamp(cmd: Command):
 
 @app.post("/control/remote")
 async def control_remote(cmd: Command):
-    """Управление светодиодом на пульте."""
     if cmd.device_id not in remotes:
-        raise HTTPException(404, "Remote not found or not a remote")
-    # Дискотека не влияет на пульты, поэтому проверку disco_active не делаем
+        raise HTTPException(404, "Remote not found")
     success = await send_command(cmd.device_id, f"{cmd.color}{cmd.status}")
     if not success:
         raise HTTPException(500, "Send failed")
     return {"status": "sent"}
 
 
+@app.post("/control/motor")
+async def control_motor(cmd: MotorCommand):
+    """Прямое управление сервоприводом (для отладки)"""
+    if cmd.device_id not in manipulators:
+        raise HTTPException(404, "Manipulator not found")
+    command = f"M{cmd.motor_id}:{cmd.position}"
+    success = await send_command(cmd.device_id, command)
+    if not success:
+        raise HTTPException(500, "Send failed")
+    return {"status": "sent", "command": command}
+
+
 @app.get("/broadcast/on")
 async def broadcast_on():
-    """Включить все светодиоды на всех лампах."""
     if not lamps:
-        raise HTTPException(400, "No lamps connected")
+        raise HTTPException(400, "No lamps")
     for did in list(lamps.keys()):
         await send_command(did, "1111")
-    return {"message": "Broadcast ON sent", "count": len(lamps)}
+    return {"message": "Broadcast ON", "count": len(lamps)}
 
 
 @app.get("/broadcast/off")
 async def broadcast_off():
-    """Выключить все светодиоды на всех лампах."""
     if not lamps:
-        raise HTTPException(400, "No lamps connected")
+        raise HTTPException(400, "No lamps")
     for did in list(lamps.keys()):
         await send_command(did, "0000")
-    return {"message": "Broadcast OFF sent", "count": len(lamps)}
+    return {"message": "Broadcast OFF", "count": len(lamps)}
 
 
+# ====================== ДИСКОТЕКА ======================
 @app.get("/disco/start")
 async def disco_start():
-    """Запустить дискотеку (только для ламп)."""
     global disco_active, disco_task, original_states
     if disco_active:
         raise HTTPException(400, "Disco already active")
     if not lamps:
-        raise HTTPException(400, "No lamps connected")
+        raise HTTPException(400, "No lamps")
 
-    # Сохраняем текущие состояния ламп
     for did in lamps:
         state_str = lamp_states.get(did)
-        if state_str:
-            parsed = parse_lamp_state(state_str)
-            original_states[did] = parsed or {'R': 0, 'Y': 0, 'G': 0, 'B': 0}
-        else:
-            original_states[did] = {'R': 0, 'Y': 0, 'G': 0, 'B': 0}
+        parsed = parse_lamp_state(state_str) if state_str else {}
+        original_states[did] = parsed or {'R': 0, 'Y': 0, 'G': 0, 'B': 0}
 
     disco_active = True
     disco_task = asyncio.create_task(disco_loop())
@@ -307,8 +390,7 @@ async def disco_start():
 
 @app.get("/disco/stop")
 async def disco_stop():
-    """Остановить дискотеку и восстановить исходные состояния ламп."""
-    global disco_active, disco_task, original_states
+    global disco_active, disco_task
     if not disco_active:
         raise HTTPException(400, "Disco not active")
 
@@ -323,7 +405,7 @@ async def disco_stop():
 
     restored = 0
     for did, states in original_states.items():
-        if did in lamps:  # проверяем, что лампа ещё онлайн
+        if did in lamps:
             for color, status in states.items():
                 await send_command(did, f"{color}{status}")
             restored += 1
@@ -332,33 +414,22 @@ async def disco_stop():
 
 
 async def disco_loop(interval: float = 0.3):
-    """Цикл дискотеки – работает только с лампами."""
-    # Прелюдия: поочередное включение цветов
-    print("[*] Прелюдия: включение цветов по порядку")
     colors_on = ['R', 'Y', 'G', 'B']
     for color in colors_on:
-        if not disco_active:
-            return
+        if not disco_active: return
         for did in list(lamps.keys()):
             await send_command(did, f"{color}1")
         await asyncio.sleep(interval)
 
     await asyncio.sleep(interval)
 
-    # Выключение в обратном порядке
-    print("[*] Прелюдия: выключение цветов в обратном порядке")
     colors_off = ['B', 'G', 'Y', 'R']
     for color in colors_off:
-        if not disco_active:
-            return
+        if not disco_active: return
         for did in list(lamps.keys()):
             await send_command(did, f"{color}0")
         await asyncio.sleep(interval)
 
-    await asyncio.sleep(interval)
-
-    # Основная дискотека
-    print("[*] Начинаем беспорядочную дискотеку!")
     while disco_active:
         for did in list(lamps.keys()):
             color = random.choice(['R', 'Y', 'G', 'B'])

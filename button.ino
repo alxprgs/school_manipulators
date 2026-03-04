@@ -2,21 +2,27 @@
 #include <Ethernet.h>
 
 // --- НАСТРОЙКИ УСТРОЙСТВА ---
-const char* DEVICE_ID = "ID:T1:DB:N1"; 
 const int TABLE_NUM = 1;
-const int DEVICE_NUM = 1;
+const int DEVICE_NUM = 1;          // номер кнопки (1..8)
 const int BUTTON_PIN = 22;
 
-byte mac[] = { 0xDE, 0xAD, 0xBE, 0xEF, 0xFE, 0x01 }; // Уникальный для каждого модуля
+byte mac[] = { 0xDE, 0xAD, 0xBE, 0xEF, 0xFE, 0x00 }; // последний байт будет заменён
 IPAddress server(192, 168, 1, 100); // IP твоего сервера
 EthernetClient client;
 
+char device_id[20];                // "ID:T<таблица>:DB:N<кнопка>"
 bool lastButtonState = HIGH;
 
 void setup() {
   pinMode(BUTTON_PIN, INPUT_PULLUP);
   Serial.begin(9600);
   
+  // Формируем идентификатор кнопки
+  sprintf(device_id, "ID:T%d:DB:N%d", TABLE_NUM, DEVICE_NUM);
+
+  // Последний байт MAC для кнопок (13..20)
+  mac[5] = 13 + (DEVICE_NUM - 1);  // 1 → 0x0D, 2 → 0x0E, ... 8 → 0x14
+
   if (Ethernet.begin(mac) == 0) {
     Serial.println("Failed to configure Ethernet using DHCP");
   }
@@ -27,7 +33,7 @@ void setup() {
 
 void connectToServer() {
   if (client.connect(server, 8888)) {
-    client.println(DEVICE_ID);
+    client.println(device_id);
     Serial.println("Connected and Identified");
   }
 }
